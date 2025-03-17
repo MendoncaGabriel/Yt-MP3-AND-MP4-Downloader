@@ -1,0 +1,19 @@
+{
+  "name": "ytmp3andmp4downloader",
+  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MendoncaGabriel/Yt-MP3-AND-MP4-Downloader.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/MendoncaGabriel/Yt-MP3-AND-MP4-Downloader/issues"
+  },
+  "homepage": "https://github.com/MendoncaGabriel/Yt-MP3-AND-MP4-Downloader#readme",
+  "description": "",
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  }
+}
