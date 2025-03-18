@@ -6,8 +6,8 @@ const ytDlp = path.resolve("yt-dlp.exe"); // Caminho do yt-dlp
 const ffmpeg = path.resolve("ffmpeg.exe"); // Caminho do ffmpeg
 const DOWNLOAD_DIR = path.resolve("downloads");
 const LIST_FILE = path.resolve("lista.txt");
-const MAX_PARALLEL = 3;
 const RESOLUTION_MAX = 1080; // Máxima resolução desejada
+const MAX_RETRIES = 3; // Número máximo de tentativas por vídeo
 
 // Garante que a pasta de downloads existe
 if (!fs.existsSync(DOWNLOAD_DIR)) {
@@ -16,10 +16,10 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
 
 // Remove caracteres especiais dos nomes de arquivos
 function limparNomeArquivo(nome) {
-    return nome.replace(/[<>:"\/\\|?*]+/g, "").trim();
+    return nome.replace(/[<>:"/\\|?*]+/g, "").trim();
 }
 
-// Lista as resoluções disponíveis e retorna a melhor até 1080p
+// Obtém a melhor resolução possível até 1080p
 function obterMelhorFormato(url) {
     return new Promise((resolve) => {
         exec(`${ytDlp} -F "${url}"`, (error, stdout) => {
@@ -28,36 +28,26 @@ function obterMelhorFormato(url) {
                 return resolve(null);
             }
 
-            const linhas = stdout.split("\n");
-            const formatos = [];
+            const formatos = stdout.split("\n")
+                .map(linha => linha.match(/(\d+)\s+\w+\s+(\d+)x(\d+)/))
+                .filter(match => match)
+                .map(match => ({ formatoId: match[1], altura: parseInt(match[3], 10) }))
+                .sort((a, b) => b.altura - a.altura);
 
-            linhas.forEach((linha) => {
-                const match = linha.match(/(\d+)\s+(\w+)\s+(\d+)x(\d+)/);
-                if (match) {
-                    const formatoId = match[1];
-                    const altura = parseInt(match[4], 10);
-                    formatos.push({ formatoId, altura });
-                }
-            });
+            const melhorFormato = formatos.find(f => f.altura <= RESOLUTION_MAX) || formatos[0];
 
-            if (formatos.length === 0) {
-                console.log(`⚠️ Nenhum formato MP4 encontrado para ${url}`);
+            if (!melhorFormato) {
+                console.log(`⚠️ Nenhum formato adequado encontrado para ${url}`);
                 return resolve(null);
             }
 
-            // Ordenar do maior para o menor
-            formatos.sort((a, b) => b.altura - a.altura);
-
-            // Pega a melhor resolução possível até o limite máximo
-            const melhorFormato = formatos.find((f) => f.altura <= RESOLUTION_MAX) || formatos[formatos.length - 1];
-
-            console.log(`🎥 Melhor resolução disponível para ${url}: ${melhorFormato.altura}p`);
+            console.log(`🎥 Melhor resolução para ${url}: ${melhorFormato.altura}p`);
             resolve(melhorFormato.formatoId);
         });
     });
 }
 
-// Mescla áudio e vídeo com FFmpeg e remove os arquivos separados
+// Mescla vídeo e áudio com FFmpeg
 function mesclarComFFmpeg(videoFile, audioFile, outputFile) {
     return new Promise((resolve) => {
         const comando = `"${ffmpeg}" -i "${videoFile}" -i "${audioFile}" -c:v copy -c:a aac -strict experimental "${outputFile}" -y`;
@@ -69,137 +59,109 @@ function mesclarComFFmpeg(videoFile, audioFile, outputFile) {
             }
 
             console.log(`✅ Mesclagem concluída: ${outputFile}`);
-
-            // Remove arquivos originais após a mesclagem
             fs.unlinkSync(videoFile);
             fs.unlinkSync(audioFile);
-
-            console.log(`🗑️ Arquivos originais removidos: ${videoFile}, ${audioFile}`);
             resolve(true);
         });
     });
 }
 
-// Baixa um único vídeo e mescla com áudio
+// Baixa um único vídeo
 async function baixarVideo(url) {
     const formato = await obterMelhorFormato(url);
-
-    if (!formato) {
-        console.error(`❌ Não foi possível determinar a melhor resolução para ${url}`);
-        return { url, sucesso: false };
-    }
+    if (!formato) return false;
 
     return new Promise((resolve) => {
         console.log(`🎬 Baixando: ${url} em formato ${formato}`);
-
         const outputTemplate = path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s");
-
         const comando = `"${ytDlp}" -f "bv*+ba" --output "${outputTemplate}" "${url}"`;
 
         exec(comando, async (error, stdout, stderr) => {
             if (error) {
                 console.error(`❌ Erro ao baixar ${url}: ${stderr}`);
-                return resolve({ url, sucesso: false });
+                return resolve(false);
             }
 
             console.log(`✅ Download concluído: ${url}`);
 
-            // Localiza os arquivos baixados
+            // Encontra os arquivos baixados
             const arquivos = fs.readdirSync(DOWNLOAD_DIR);
             const baseName = limparNomeArquivo(url.split("=").pop());
-            const videoFile = arquivos.find((file) => file.includes(baseName) && file.endsWith(".mp4"));
-            const audioFile = arquivos.find((file) => file.includes(baseName) && file.endsWith(".m4a"));
+            const videoFile = arquivos.find(f => f.includes(baseName) && f.endsWith(".mp4"));
+            const audioFile = arquivos.find(f => f.includes(baseName) && f.endsWith(".m4a"));
 
             if (!videoFile || !audioFile) {
                 console.error(`❌ Arquivos de vídeo/áudio não encontrados para ${url}`);
-                return resolve({ url, sucesso: false });
+                return resolve(false);
             }
 
-            const videoPath = path.join(DOWNLOAD_DIR, videoFile);
-            const audioPath = path.join(DOWNLOAD_DIR, audioFile);
-            const outputPath = path.join(DOWNLOAD_DIR, `${baseName}-gv.mp4`);
+            const sucesso = await mesclarComFFmpeg(
+                path.join(DOWNLOAD_DIR, videoFile),
+                path.join(DOWNLOAD_DIR, audioFile),
+                path.join(DOWNLOAD_DIR, `${baseName}-gv.mp4`)
+            );
 
-            const sucesso = await mesclarComFFmpeg(videoPath, audioPath, outputPath);
-            resolve({ url, sucesso });
+            resolve(sucesso);
         });
     });
 }
 
-// Lê e filtra a lista de URLs
+// Lê a lista de URLs do arquivo
 async function lerLista() {
     try {
         const data = fs.readFileSync(LIST_FILE, "utf8");
-        let urls = data.split("\n").map((url) => url.trim()).filter(Boolean);
-
-        // Remove duplicatas
-        const urlsUnicas = [...new Set(urls)];
-
-        return { urls: urlsUnicas, duplicadas: urls.length - urlsUnicas.length };
+        const urls = [...new Set(data.split("\n").map(url => url.trim()).filter(Boolean))];
+        return urls;
     } catch (err) {
         console.error("Erro ao ler lista:", err);
-        return { urls: [], duplicadas: 0 };
+        return [];
     }
 }
 
-// Controla downloads em paralelo
-async function baixarVideosEmLote(urls) {
-    let index = 0;
+// Controla o fluxo de download e re-tentativas
+async function baixarVideos(urls) {
     let urlsComErro = [];
 
-    async function baixarProximo() {
-        if (index >= urls.length) return;
+    for (const url of urls) {
+        let sucesso = false;
+        for (let tentativa = 1; tentativa <= MAX_RETRIES; tentativa++) {
+            console.log(`🔄 Tentativa ${tentativa} de ${MAX_RETRIES} para: ${url}`);
+            sucesso = await baixarVideo(url);
+            if (sucesso) break;
+        }
 
-        const url = urls[index++];
-        const resultado = await baixarVideo(url);
-
-        if (!resultado.sucesso) urlsComErro.push(resultado.url);
-        await baixarProximo();
+        if (!sucesso) {
+            console.error(`❌ Falha final no download: ${url}`);
+            urlsComErro.push(url);
+        }
     }
 
-    const tarefas = [];
-    for (let i = 0; i < Math.min(MAX_PARALLEL, urls.length); i++) {
-        tarefas.push(baixarProximo());
-    }
-
-    await Promise.all(tarefas);
     return urlsComErro;
-}
-
-// Reexecuta downloads que falharam, um por um
-async function rebaixarFalhas(urlsComErro) {
-    console.log("\n🔄 Tentando baixar novamente os vídeos que falharam...");
-    let urlsAindaComErro = [];
-
-    for (const url of urlsComErro) {
-        const resultado = await baixarVideo(url);
-        if (!resultado.sucesso) urlsAindaComErro.push(url);
-    }
-
-    return urlsAindaComErro;
 }
 
 // Fluxo principal
 async function main() {
     try {
-        const { urls, duplicadas } = await lerLista();
-        console.log(`🔹 Vídeos únicos encontrados: ${urls.length}`);
-        console.log(`🔸 URLs duplicadas removidas: ${duplicadas}`);
+        const urls = await lerLista();
 
         if (urls.length === 0) {
             console.log("❌ Nenhuma URL para baixar.");
             return;
         }
 
-        let urlsComErro = await baixarVideosEmLote(urls);
+        console.log(`🔹 Total de vídeos a baixar: ${urls.length}`);
 
-        if (urlsComErro.length > 0) {
-            console.log(`\n⚠️ ${urlsComErro.length} vídeos falharam na primeira tentativa.`);
-            urlsComErro = await rebaixarFalhas(urlsComErro);
-        }
+        const urlsComErro = await baixarVideos(urls);
 
         console.log(`\n🔹 Total de vídeos baixados com sucesso: ${urls.length - urlsComErro.length}`);
-        console.log(`🔸 URLs com falha no download:`);
-        console.log(urlsComErro.length ? urlsComErro.join("\n") : "Nenhuma falha.");
+        console.log(`🔸 URLs que falharam:`);
+
+        if (urlsComErro.length) {
+            console.log(urlsComErro.join("\n"));
+        } else {
+            console.log("✅ Nenhuma falha.");
+        }
+
         console.log("\n✅ Todos os downloads foram concluídos!");
     } catch (err) {
         console.error("Erro:", err);
